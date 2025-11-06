@@ -4,7 +4,9 @@ const express = require('express');
 const { Pool } = require('pg');
 const xrplService = require('./xrpl-service');
 const xrpl = require('xrpl');
-var cors = require('cors')
+var cors = require('cors');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(cors());
@@ -20,39 +22,111 @@ const pool = new Pool({
     port: process.env.DB_PORT,
 });
 
+// MIDDLEWARE TO VERIFY JWT TOKENS
+// This middleware checks if a valid JWT is present
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1]; // Format: "Bearer TOKEN"
+
+    if (token == null) {
+        return res.sendStatus(401); // Unauthorized
+    }
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) {
+            return res.sendStatus(403); // Forbidden (token is no longer valid)
+        }
+        req.user = user; // Attach the decoded user payload to the request object
+        next(); // Proceed to the next function (the actual endpoint logic)
+    });
+};
+
+// This middleware checks if the authenticated user is an admin
+const authorizeAdmin = (req, res, next) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden: Admin access required.' });
+    }
+    next();
+};
+
 // --- USER ENDPOINTS ---
 
-// Create a new user and their custodial XRPL wallet
-app.post('/users', async (req, res) => {
-    const { name, email } = req.body;
-    if (!name || !email) {
-        return res.status(400).json({ error: 'Name and email are required.' });
+app.post('/register', async (req, res) => {
+    const { name, email, password } = req.body;
+    if (!name || !email || !password) {
+        return res.status(400).json({ error: 'Name, email, and password are required.' });
     }
 
     try {
+        // Hash the password before storing it
+        const salt = await bcrypt.genSalt(10);
+        const password_hash = await bcrypt.hash(password, salt);
+
+        // We still create a custodial wallet for the new user
         const { address, seed } = xrplService.createCustodialWallet();
         const encryptedSeed = seed; // In production: Encrypt this!
-
-        // Step 1: Fund the base wallet with XRP TODO REMOVE THIS LATER
         await xrplService.fundNewWallet(address);
-
-        // CHANGED: Step 2: Automatically set up the TrustLine for our AED token
         await xrplService.setupFiatTrustLine(seed);
 
         const newUser = await pool.query(
-            'INSERT INTO users (name, email, xrpl_address, xrpl_seed_encrypted) VALUES ($1, $2, $3, $4) RETURNING id, name, email, xrpl_address',
-            [name, email, address, encryptedSeed]
+            'INSERT INTO users (name, email, password_hash, xrpl_address, xrpl_seed_encrypted) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, email, role',
+            [name, email, password_hash, address, encryptedSeed]
         );
 
         res.status(201).json(newUser.rows[0]);
     } catch (error) {
-        console.error('Failed to create user:', error);
+        // Handle cases where email is already taken
+        if (error.code === '23505') {
+            return res.status(409).json({ error: 'Email address is already registered.' });
+        }
+        console.error('Failed to register user:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
 
+app.post('/login', async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) {
+        return res.status(400).json({ error: 'Email and password are required.' });
+    }
+
+    try {
+        const userRes = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+        if (userRes.rowCount === 0) {
+            return res.status(401).json({ error: 'Invalid credentials.' }); // User not found
+        }
+        const user = userRes.rows[0];
+
+        // Compare the provided password with the stored hash
+        const isMatch = await bcrypt.compare(password, user.password_hash);
+        if (!isMatch) {
+            return res.status(401).json({ error: 'Invalid credentials.' }); // Password incorrect
+        }
+
+        // If credentials are correct, create a JWT
+        const payload = {
+            id: user.id,
+            email: user.email,
+            role: user.role,
+        };
+
+        const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1d' }); // Token expires in 1 day
+
+        res.json({
+            message: 'Login successful!',
+            token: token,
+            user: payload
+        });
+
+    } catch (error) {
+        console.error('Login failed:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+
 // Simulate a fiat deposit for a user
-app.post('/deposit-fiat', async (req, res) => {
+app.post('/deposit-fiat', authenticateToken, async (req, res) => {
     const { userId, amount } = req.body;
     if (!userId || !amount || amount <= 0) {
         return res.status(400).json({ error: 'Valid userId and positive amount are required.' });
@@ -76,7 +150,7 @@ app.post('/deposit-fiat', async (req, res) => {
 // --- PROPERTY & INVESTMENT ENDPOINTS ---
 
 // List a new property for tokenization
-app.post('/properties', async (req, res) => {
+app.post('/properties', authenticateToken, authorizeAdmin, async (req, res) => {
     const { name, total_value_aed, tokens_to_issue, token_name } = req.body;
     // We create a hex currency code from the token name. e.g., "HSMB01"
     const token_currency_code = xrpl.convertStringToHex(token_name).padEnd(40, '0');
@@ -96,10 +170,28 @@ app.post('/properties', async (req, res) => {
 
 // Get all properties listed on the platform
 app.get('/get-properties', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT * FROM properties ORDER BY created_at DESC');
+   try {
+        // This advanced query joins properties with the sum of their investments.
+        // COALESCE is used to return 0 for properties with no investments yet.
+        const query = `
+            SELECT 
+                p.*, 
+                COALESCE(SUM(i.amount_invested_aed), 0) as amount_raised_aed
+            FROM 
+                properties p
+            LEFT JOIN 
+                investments i ON p.id = i.property_id
+            GROUP BY 
+                p.id
+            ORDER BY 
+                p.created_at DESC;
+        `;
+
+        const result = await pool.query(query);
         res.status(200).json(result.rows);
-    } catch (error) {
+        
+    } catch (error)
+     {
         console.error('Failed to get properties:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
@@ -107,7 +199,7 @@ app.get('/get-properties', async (req, res) => {
 
 // Main investment endpoint
 // Main investment endpoint - FINAL VERSION WITH RACE CONDITION FIX
-app.post('/invest', async (req, res) => {
+app.post('/invest', authenticateToken, async (req, res) => {
     // Ensure amountInvestedAed is a number right away
     const { userId, propertyId } = req.body;
     const amountInvestedAed = parseFloat(req.body.amountInvestedAed);
@@ -227,11 +319,48 @@ app.post('/invest', async (req, res) => {
     }
 });
 
+app.get('/users/:userId/investments', authenticateToken, async (req, res) => {
+    if (req.user.id !== req.params.userId && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden: You can only access your own data.' });
+    }
+    const { userId } = req.params;
+
+    try {
+        // This query joins investments with properties to get the property name
+        const query = `
+            SELECT 
+                i.id,
+                i.property_id,
+                p.name AS property_name,
+                i.amount_invested_aed,
+                i.tokens_received,
+                i.xrpl_tx_hash,
+                i.created_at AS investment_date
+            FROM 
+                investments i
+            JOIN 
+                properties p ON i.property_id = p.id
+            WHERE 
+                i.user_id = $1
+            ORDER BY 
+                i.created_at DESC;
+        `;
+        const result = await pool.query(query, [userId]);
+
+        // If the user exists but has no investments, this will correctly return an empty array []
+        res.status(200).json(result.rows);
+
+    } catch (error) {
+        console.error(`Failed to get investments for user ${userId}:`, error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // ====================================================================
 // NEW ENDPOINT: To pre-mint all tokens for a property
 // In a real app, this should be protected and only callable by an admin.
 // ====================================================================
-app.post('/properties/:propertyId/mint', async (req, res) => {
+app.post('/properties/:propertyId/mint', authenticateToken, authorizeAdmin, async (req, res) => {
     const { propertyId } = req.params;
     try {
         const propRes = await pool.query('SELECT * FROM properties WHERE id = $1', [propertyId]);
@@ -264,41 +393,78 @@ app.post('/properties/:propertyId/mint', async (req, res) => {
 
 // Simulate distributing rent for a property
 // This endpoint now uses AED per token to calculate distributions
-app.post('/distribute-rent', async (req, res) => {
-    // Body now expects rentInAedPerToken
+app.post('/distribute-rent', authenticateToken, authorizeAdmin, async (req, res) => {
     const { propertyId, totalRentAed, rentInAedPerToken } = req.body;
-    if (!propertyId || !totalRentAed || !rentInAedPerToken) {
-        return res.status(400).json({ error: 'propertyId, totalRentAed, and rentInAedPerToken are required.' });
+
+    // Basic Input Validation
+    if (!propertyId || !totalRentAed || !rentInAedPerToken || totalRentAed <= 0 || rentInAedPerToken <= 0) {
+        return res.status(400).json({ error: 'Valid propertyId, and positive totalRentAed and rentInAedPerToken are required.' });
     }
 
     try {
-        // Find all investors for this property and their token count
-        const investorsRes = await pool.query(
-            'SELECT u.xrpl_address, i.tokens_received FROM investments i JOIN users u ON i.user_id = u.id WHERE i.property_id = $1',
-            [propertyId]
-        );
+        // Step 1: Get Property and check if it's fully funded
+        const propRes = await pool.query('SELECT * FROM properties WHERE id = $1', [propertyId]);
+        if (propRes.rowCount === 0) {
+            return res.status(404).json({ error: 'Property not found.' });
+        }
+        const property = propRes.rows[0];
 
-        if (investorsRes.rowCount === 0) {
+        // --- CRITICAL BUSINESS LOGIC CHECK ---
+        if (!property.is_fully_funded) {
+            return res.status(400).json({ error: 'Cannot distribute rent on a property that is not yet fully funded.' });
+        }
+
+        // Step 2: Get all token holders for this property by summing up their investments
+        // This correctly handles users who have invested multiple times.
+        const holdersQuery = `
+            SELECT 
+                i.user_id,
+                u.xrpl_address,
+                SUM(i.tokens_received) AS total_tokens_held
+            FROM 
+                investments i
+            JOIN 
+                users u ON i.user_id = u.id
+            WHERE 
+                i.property_id = $1
+            GROUP BY 
+                i.user_id, u.xrpl_address;
+        `;
+        const holdersRes = await pool.query(holdersQuery, [propertyId]);
+
+        if (holdersRes.rowCount === 0) {
             return res.status(404).json({ message: 'No investors found for this property.' });
         }
 
-        // Calculate AED rent due for each holder
-        const holders = investorsRes.rows.map(row => ({
+        // Step 3: Calculate the precise rent due for each holder
+        const holders = holdersRes.rows.map(row => ({
             propertyId: propertyId,
             xrpl_address: row.xrpl_address,
-            balance: row.tokens_received,
-            rent_due_aed: parseFloat(row.tokens_received) * rentInAedPerToken,
+            // Use parseFloat to ensure numbers are not strings
+            rent_due_aed: parseFloat(row.total_tokens_held) * parseFloat(rentInAedPerToken),
         }));
         
-        // Use XRPL service to send payments in our AED token
+        // Optional Sanity Check: Ensure the total to be distributed matches the input
+        const totalCalculatedRent = holders.reduce((sum, holder) => sum + holder.rent_due_aed, 0);
+        console.log(`Admin entered total rent: ${totalRentAed}. Calculated total to be paid: ${totalCalculatedRent.toFixed(2)}.`);
+        // Note: These might not match perfectly due to rounding in token calculation.
+        // For a real system, you would need a clear policy on how to handle these rounding differences.
+
+        // Step 4: Distribute the payments via the XRPL service
         const distributionResults = await xrplService.distributeRent(holders);
 
-        await pool.query(
-            'INSERT INTO rental_distributions (property_id, total_rent_aed, distribution_date) VALUES ($1, $2, NOW())',
-            [propertyId, totalRentAed]
-        );
+        // Step 5: Record the distribution event for historical tracking
+       await pool.query(
+            'INSERT INTO rental_distributions (property_id, total_rent_aed, distribution_date, rent_per_token_aed) VALUES ($1, $2, NOW(), $3)',
+    // Add the missing propertyId to the front of this array
+    [propertyId, totalRentAed, rentInAedPerToken]
+);
 
-        res.status(200).json({ message: 'Rent distribution process initiated.', results: distributionResults });
+res.status(200).json({
+    message: 'Rent distribution process initiated.',
+    calculatedTotal: totalCalculatedRent,
+    results: distributionResults
+});
 
     } catch (error) {
         console.error('Rent distribution failed:', error);
@@ -307,19 +473,31 @@ app.post('/distribute-rent', async (req, res) => {
 });
 
 // Get a user's dashboard view
-app.get('/dashboard/:userId', async (req, res) => {
+app.get('/dashboard/:userId', authenticateToken, async (req, res) => {
+     if (req.user.id !== req.params.userId && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden: You can only access your own data.' });
+    }
+
     const { userId } = req.params;
     try {
         const userRes = await pool.query('SELECT id, name, email, fiat_balance_aed, xrpl_address FROM users WHERE id = $1', [userId]);
         if (userRes.rowCount === 0) return res.status(404).json({ error: 'User not found' });
         
+        // --- THIS QUERY IS THE ONLY PART THAT CHANGES ---
         const holdingsRes = await pool.query(
-            'SELECT p.name, p.token_currency_code, i.tokens_received FROM investments i JOIN properties p ON i.property_id = p.id WHERE i.user_id = $1',
+            `SELECT 
+                p.name, 
+                p.token_currency_code, 
+                p.token_currency_name,
+                i.tokens_received 
+            FROM 
+                investments i 
+            JOIN 
+                properties p ON i.property_id = p.id 
+            WHERE 
+                i.user_id = $1`,
             [userId]
         );
-
-        // In a real app, you would also query the XRPL for rental income transactions
-        // or query the rental_distributions table.
 
         res.json({
             userInfo: userRes.rows[0],
@@ -331,6 +509,57 @@ app.get('/dashboard/:userId', async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
+
+app.get('/users/:userId/rent-history', authenticateToken, async (req, res) => {
+    if (req.user.id !== req.params.userId && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden: You can only access your own data.' });
+    }
+    const { userId } = req.params;
+
+    try {
+        // This query is more complex:
+        // 1. It first calculates the user's total tokens for each property they've invested in.
+        // 2. It then joins that with every rent distribution that has happened for those properties.
+        // 3. Finally, it calculates the user's specific earnings for each event.
+        const query = `
+            WITH user_holdings AS (
+                SELECT 
+                    property_id, 
+                    SUM(tokens_received) AS total_tokens
+                FROM 
+                    investments
+                WHERE 
+                    user_id = $1
+                GROUP BY 
+                    property_id
+            )
+            SELECT 
+                p.name AS property_name,
+                rd.distribution_date,
+                uh.total_tokens AS tokens_held,
+                rd.rent_per_token_aed,
+                (uh.total_tokens * rd.rent_per_token_aed) AS rent_received_aed
+            FROM 
+                rental_distributions rd
+            JOIN 
+                user_holdings uh ON rd.property_id = uh.property_id
+            JOIN
+                properties p ON rd.property_id = p.id
+            ORDER BY 
+                rd.distribution_date DESC;
+        `;
+        const result = await pool.query(query, [userId]);
+
+        res.status(200).json(result.rows);
+
+    } catch (error) {
+        console.error(`Failed to get rent history for user ${userId}:`, error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+
+
 
 
 // --- Server Start ---
