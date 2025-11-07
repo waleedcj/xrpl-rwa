@@ -1,6 +1,6 @@
 const xrpl = require('xrpl');
 
-const mySeed = "sEdTMAXggxeXDKREEkvWwTFAzrFQE43"; 
+const mySeed = "your_seed_here";
 
 try {
     // Create a Wallet instance from the seed
