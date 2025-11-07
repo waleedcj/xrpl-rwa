@@ -106,6 +106,7 @@ app.post('/login', async (req, res) => {
         // If credentials are correct, create a JWT
         const payload = {
             id: user.id,
+            name: user.name,
             email: user.email,
             role: user.role,
         };
@@ -176,7 +177,8 @@ app.get('/get-properties', async (req, res) => {
         const query = `
             SELECT 
                 p.*, 
-                COALESCE(SUM(i.amount_invested_aed), 0) as amount_raised_aed
+                COALESCE(SUM(i.amount_invested_aed), 0) as amount_raised_aed,
+                COUNT(DISTINCT i.user_id) AS holder_count
             FROM 
                 properties p
             LEFT JOIN 
@@ -471,6 +473,82 @@ res.status(200).json({
         res.status(500).json({ error: 'Internal server error' });
     }
 });
+
+app.post('/unfreeze', authenticateToken, authorizeAdmin, async (req, res) => {
+    // We need to know WHICH user and WHICH property token to unfreeze.
+    const { userId, propertyId } = req.body;
+    if (!userId || !propertyId) {
+        return res.status(400).json({ error: 'userId and propertyId are required.' });
+    }
+
+    try {
+        // Step 1: Get the user's encrypted seed and the property's token code from the DB.
+        const userRes = await pool.query('SELECT xrpl_seed_encrypted FROM users WHERE id = $1', [userId]);
+        const propRes = await pool.query('SELECT token_currency_code FROM properties WHERE id = $1', [propertyId]);
+
+        if (userRes.rowCount === 0) {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+        if (propRes.rowCount === 0) {
+            return res.status(404).json({ error: 'Property not found.' });
+        }
+
+        const userSeed = userRes.rows[0].xrpl_seed_encrypted; // In production, decrypt this first
+        const tokenCurrencyCode = propRes.rows[0].token_currency_code;
+
+        // Step 2: Call the XRPL service to perform the unfreeze transaction.
+        const txHash = await xrplService.unfreezeTokens(userSeed, tokenCurrencyCode);
+
+        res.status(200).json({
+            message: "Tokens successfully unfrozen.",
+            userId,
+            propertyId,
+            unfreezeTxHash: txHash,
+        });
+
+    } catch (error) {
+        console.error('Failed to unfreeze tokens:', error);
+        // Handle potential XRPL errors, e.g., if the trustline doesn't exist
+        res.status(500).json({ error: 'An error occurred during the unfreeze process.', details: error.message });
+    }
+});
+
+app.get('/properties/:propertyId/holders', authenticateToken, authorizeAdmin, async (req, res) => {
+    const { propertyId } = req.params;
+
+    try {
+        // This query finds all unique users who have invested in the given property.
+        // It joins with the users table to get their name and email.
+        // It sums their investments to show their total token holdings.
+        const query = `
+            SELECT 
+                u.id AS user_id,
+                u.name,
+                u.email,
+                u.xrpl_address,
+                SUM(i.tokens_received) AS total_tokens_held
+            FROM 
+                investments i
+            JOIN 
+                users u ON i.user_id = u.id
+            WHERE 
+                i.property_id = $1
+            GROUP BY 
+                u.id, u.name, u.email, u.xrpl_address
+            ORDER BY 
+                SUM(i.tokens_received) DESC;
+        `;
+        const result = await pool.query(query, [propertyId]);
+
+        // This will return an empty array if there are no holders yet, which is correct.
+        res.status(200).json(result.rows);
+
+    } catch (error) {
+        console.error(`Failed to get holders for property ${propertyId}:`, error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 
 // Get a user's dashboard view
 app.get('/dashboard/:userId', authenticateToken, async (req, res) => {

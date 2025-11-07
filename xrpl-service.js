@@ -37,7 +37,7 @@ async function fundNewWallet(walletAddress) {
     const prepared = await client.autofill({
         TransactionType: 'Payment',
         Account: operationalWallet.address,
-        Amount: '15000000', // 15 XRP (10 base + 2 for property token TL + 2 for AED TL)
+        Amount: '1500000', // 1.5 XRP (0.5 base + 0.5 for property token TL + 0.5 for AED TL)
         Destination: walletAddress,
     });
 
@@ -199,6 +199,33 @@ async function distributeAndFreezeTokens(userSeed, tokenCurrencyCode, tokenAmoun
     return paymentResult.result.hash;
 }
 
+async function unfreezeTokens(userSeed, tokenCurrencyCode) {
+    const client = await getClient();
+    const userWallet = xrpl.Wallet.fromSeed(userSeed);
+    const issuerAddress = xrpl.Wallet.fromSeed(ISSUER_WALLET_SEED).address;
+
+    // To unfreeze, we send a TrustSet transaction with the tfClearFreeze flag.
+    const unfreezeTx = {
+        TransactionType: 'TrustSet',
+        Account: userWallet.address,
+        LimitAmount: {
+            currency: tokenCurrencyCode,
+            issuer: issuerAddress,
+            // The value field is ignored when clearing a freeze, but it must be present.
+            // We can just set it to a high limit.
+            value: '1000000000',
+        },
+        Flags: xrpl.TrustSetFlags.tfClearFreeze, // <-- The key flag to UNFREEZE
+    };
+
+    const prepared = await client.autofill(unfreezeTx);
+    const signed = userWallet.sign(prepared);
+    const result = await client.submitAndWait(signed.tx_blob);
+
+    console.log(`Property token TrustLine UN-FROZEN for ${userWallet.address} for token ${tokenCurrencyCode}.`);
+    return result.result.hash;
+}
+
 // CHANGED: This function now distributes our dummy AED token, not XRP.
 async function distributeRent(holders) {
     const client = await getClient();
@@ -208,6 +235,8 @@ async function distributeRent(holders) {
     for (const holder of holders) {
         if (holder.rent_due_aed <= 0) continue;
 
+        const roundedAmount = holder.rent_due_aed.toFixed(6);
+
         const payment = {
             TransactionType: 'Payment',
             Account: operationalWallet.address,
@@ -215,7 +244,7 @@ async function distributeRent(holders) {
             Amount: {
                 currency: FIAT_CURRENCY_CODE,
                 issuer: operationalWallet.address,
-                value: holder.rent_due_aed.toString()
+                value: roundedAmount,
             },
             Destination: holder.xrpl_address,
             Memos: [{
@@ -258,6 +287,7 @@ module.exports = {
     configureIssuerAccount,
     mintAllPropertyTokens, 
     distributeAndFreezeTokens,
+    unfreezeTokens,
     distributeRent,
     ISSUER_WALLET_ADDRESS: xrpl.Wallet.fromSeed(ISSUER_WALLET_SEED).address
 };
